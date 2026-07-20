@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 
 use pngstreamenc::{
-    close_png_encode, encode_scanlines, free_error_string, get_last_error, open_png_encode,
+    close_png_encode, encode_scanlines, free_error_string_enc, get_last_error, open_png_encode,
     open_png_encode_stream, ZlibOptions,
 };
 
@@ -208,7 +208,7 @@ fn print_last_error() {
     if !err_ptr.is_null() {
         let c_str = unsafe { std::ffi::CStr::from_ptr(err_ptr) };
         eprintln!("{}", format!("Error: {}", c_str.to_string_lossy()).bright_red());
-        free_error_string(err_ptr as *mut _);
+        free_error_string_enc(err_ptr as *mut _);
     } else {
         eprintln!("{}", "Error: Encoding failed (no further details provided).".bright_red());
     }
@@ -305,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !err_ptr.is_null() {
                 let c_str = std::ffi::CStr::from_ptr(err_ptr);
                 eprintln!("{}", format!("Error initializing encoder: {}", c_str.to_string_lossy()).bright_red());
-                free_error_string(err_ptr as *mut _);
+                free_error_string_enc(err_ptr as *mut _);
             }
         }
         std::process::exit(1);
