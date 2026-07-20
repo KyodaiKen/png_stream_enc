@@ -1,0 +1,11 @@
+[package]
+name = "encoder"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pngstreamenc"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+libz-sys = "1.1"
