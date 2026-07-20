@@ -8,7 +8,6 @@ encoder = { path = "../encoder" }
 clap = { version = "4.0", features = ["derive"] }
 owo-colors = "4.0"
 libc = "0.2"
-memmap2 = "0.9.11"
 
 [[bin]]
 name = "pngstreamenc-cli"
