@@ -473,7 +473,7 @@ pub extern "C" fn close_png_encode(handle: *mut PngEncoder) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_last_error() -> *const c_char {
+pub extern "C" fn get_last_error_enc() -> *const c_char {
     LAST_ERROR.with(|e| {
         let err = e.borrow();
         let sanitized: Vec<u8> = err.bytes().filter(|&b| b != 0).collect();

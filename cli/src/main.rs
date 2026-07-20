@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 
 use pngstreamenc::{
-    close_png_encode, encode_scanlines, free_error_string_enc, get_last_error, open_png_encode,
+    close_png_encode, encode_scanlines, free_error_string_enc, get_last_error_enc, open_png_encode,
     open_png_encode_stream, ZlibOptions,
 };
 
@@ -204,7 +204,7 @@ fn read_image_header<R: BufRead>(reader: &mut R) -> std::io::Result<(u32, u32, u
 }
 
 fn print_last_error() {
-    let err_ptr = get_last_error();
+    let err_ptr = get_last_error_enc();
     if !err_ptr.is_null() {
         let c_str = unsafe { std::ffi::CStr::from_ptr(err_ptr) };
         eprintln!("{}", format!("Error: {}", c_str.to_string_lossy()).bright_red());
@@ -301,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if handle.is_null() {
         unsafe {
-            let err_ptr = get_last_error();
+            let err_ptr = get_last_error_enc();
             if !err_ptr.is_null() {
                 let c_str = std::ffi::CStr::from_ptr(err_ptr);
                 eprintln!("{}", format!("Error initializing encoder: {}", c_str.to_string_lossy()).bright_red());
