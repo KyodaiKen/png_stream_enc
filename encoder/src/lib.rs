@@ -133,13 +133,13 @@ fn apply_filter_sub(curr: &[u8], bpp: usize, out: &mut [u8]) -> u64 {
     for i in 0..first {
         let val = curr[i];
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
 
     for i in first..len {
         let val = curr[i].wrapping_sub(curr[i - bpp]);
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
     sad
 }
@@ -154,7 +154,7 @@ fn apply_filter_up(curr: &[u8], prev: &[u8], out: &mut [u8]) -> u64 {
     for i in 0..len {
         let val = curr[i].wrapping_sub(prev[i]);
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
     sad
 }
@@ -171,7 +171,7 @@ fn apply_filter_avg(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u64
         let avg = (prev[i] / 2) as u8;
         let val = curr[i].wrapping_sub(avg);
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
 
     for i in first..len {
@@ -180,7 +180,7 @@ fn apply_filter_avg(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u64
         let avg = ((a + b) / 2) as u8;
         let val = curr[i].wrapping_sub(avg);
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
     sad
 }
@@ -214,7 +214,7 @@ fn apply_filter_paeth(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u
     for i in 0..first {
         let val = curr[i].wrapping_sub(paeth_predict(0, prev[i], 0));
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
 
     for i in first..len {
@@ -223,7 +223,7 @@ fn apply_filter_paeth(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u
         let c = prev[i - bpp];
         let val = curr[i].wrapping_sub(paeth_predict(a, b, c));
         out_payload[i] = val;
-        sad += val as u64;
+        sad += (val as i8).unsigned_abs() as u64;
     }
     sad
 }
