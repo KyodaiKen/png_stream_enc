@@ -15,6 +15,7 @@ fn set_last_error(msg: &str) {
 }
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+const MAX_PNG_CHUNK_SIZE: usize = 0x7FFF_FFFF; // 2^31 - 1 bytes (2,147,483,647 bytes)
 
 #[repr(C)]
 pub struct ZlibOptions {
@@ -22,6 +23,9 @@ pub struct ZlibOptions {
     pub strategy: i32,
     pub window_bits: i32,
     pub mem_level: i32,
+    /// Maximum size of an IDAT chunk payload.
+    /// Set to 0 or 0x7FFFFFFF to create as few IDAT chunks as possible.
+    pub max_idat_size: u32,
 }
 
 pub type PngWriteCallback = unsafe extern "C" fn(user_data: *mut std::ffi::c_void, buf: *const u8, len: usize) -> usize;
@@ -53,10 +57,12 @@ pub struct PngEncoder {
     pub height: u32,
     pub bit_depth: u8,
     pub color_type: u8,
-    pub filter_type: u8, // 0: None, 1: Sub, 2: Up, 3: Avg, 4: Paeth, 5: Adaptive
+    pub filter_type: u8,
     pub bytes_per_scanline: usize,
     pub bpp: usize,
+    pub max_idat_size: usize,
     out_buf: Vec<u8>,
+    idat_accumulator: Vec<u8>,
     row_buf: Vec<u8>,
     prev_row: Vec<u8>,
     temp_row: Vec<u8>,
@@ -84,15 +90,27 @@ fn write_chunk(writer: &mut dyn Write, chunk_type: &[u8; 4], data: &[u8]) -> std
     Ok(())
 }
 
+fn flush_idat_accumulator(enc: &mut PngEncoder, force: bool) -> Result<(), String> {
+    while enc.idat_accumulator.len() >= enc.max_idat_size || (force && !enc.idat_accumulator.is_empty()) {
+        let chunk_size = enc.idat_accumulator.len().min(enc.max_idat_size);
+
+        // Drain up to max_idat_size bytes from the accumulator and write as an IDAT chunk
+        let chunk_data: Vec<u8> = enc.idat_accumulator.drain(..chunk_size).collect();
+        write_chunk(&mut enc.writer, b"IDAT", &chunk_data)
+        .map_err(|_| "Failed to write IDAT chunk".to_string())?;
+    }
+    Ok(())
+}
+
 fn write_idat(enc: &mut PngEncoder) -> Result<(), String> {
     let produced = enc.out_buf.len() - enc.zstream.avail_out as usize;
     if produced > 0 {
-        write_chunk(&mut enc.writer, b"IDAT", &enc.out_buf[..produced])
-        .map_err(|_| "Failed to write IDAT chunk".to_string())?;
+        enc.idat_accumulator.extend_from_slice(&enc.out_buf[..produced]);
     }
     enc.zstream.next_out = enc.out_buf.as_mut_ptr();
     enc.zstream.avail_out = enc.out_buf.len() as u32;
-    Ok(())
+
+    flush_idat_accumulator(enc, false)
 }
 
 // High performance filter implementations
@@ -196,7 +214,7 @@ fn apply_filter_paeth(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u
     for i in 0..first {
         let val = curr[i].wrapping_sub(paeth_predict(0, prev[i], 0));
         out_payload[i] = val;
-        sad += (val as i8).unsigned_abs() as u64;
+        sad += val as u64;
     }
 
     for i in first..len {
@@ -205,7 +223,7 @@ fn apply_filter_paeth(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> u
         let c = prev[i - bpp];
         let val = curr[i].wrapping_sub(paeth_predict(a, b, c));
         out_payload[i] = val;
-        sad += (val as i8).unsigned_abs() as u64;
+        sad += val as u64;
     }
     sad
 }
@@ -298,10 +316,16 @@ impl PngEncoder {
             Box::from_raw(raw as *mut libz_sys::z_stream)
         };
 
-        // Increase buffer sizes to avoid voluntary context switching from constant flushing
         let mut out_buf = vec![0u8; 2 * 1024 * 1024];
         zstream.next_out = out_buf.as_mut_ptr();
         zstream.avail_out = out_buf.len() as u32;
+
+        // If max_idat_size is 0, default to the PNG maximum size (2^31 - 1 bytes)
+        let max_idat_size = if options.max_idat_size == 0 {
+            MAX_PNG_CHUNK_SIZE
+        } else {
+            (options.max_idat_size as usize).min(MAX_PNG_CHUNK_SIZE)
+        };
 
         Ok(Self {
             writer: BufWriter::with_capacity(1024 * 1024, writer),
@@ -313,7 +337,9 @@ impl PngEncoder {
            filter_type,
            bytes_per_scanline,
            bpp,
+           max_idat_size,
            out_buf,
+           idat_accumulator: Vec::new(),
            row_buf: vec![0u8; bytes_per_scanline + 1],
            prev_row: vec![0u8; bytes_per_scanline],
            temp_row: vec![0u8; bytes_per_scanline + 1],
@@ -455,6 +481,12 @@ pub extern "C" fn close_png_encode(handle: *mut PngEncoder) -> bool {
 
     if let Err(e) = write_idat(&mut enc) {
         set_last_error(&format!("IO Write Error writing remaining IDAT data: {}", e));
+        return false;
+    }
+
+    // Force flush any remaining accumulated IDAT data
+    if let Err(e) = flush_idat_accumulator(&mut enc, true) {
+        set_last_error(&format!("IO Write Error flushing accumulated IDAT chunks: {}", e));
         return false;
     }
 
