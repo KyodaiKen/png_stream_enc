@@ -247,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         strategy: strategy_val,
         window_bits: args.window_bits,
         mem_level: args.mem_level,
-        max_idat_size: 0,
+        max_idat_size: 8388608,
         expected_idat_size: 0,
     };
 
