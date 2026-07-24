@@ -26,6 +26,9 @@ pub struct ZlibOptions {
     /// Maximum size of an IDAT chunk payload.
     /// Set to 0 or 0x7FFFFFFF to create as few IDAT chunks as possible.
     pub max_idat_size: u32,
+    /// Expected total raw compressed IDAT payload size (0 if unknown).
+    /// When > 0, enables single-pass streaming of IDAT chunks directly to file.
+    pub expected_idat_size: usize,
 }
 
 pub type PngWriteCallback = unsafe extern "C" fn(user_data: *mut std::ffi::c_void, buf: *const u8, len: usize) -> usize;
@@ -66,6 +69,13 @@ pub struct PngEncoder {
     row_buf: Vec<u8>,
     prev_row: Vec<u8>,
     temp_row: Vec<u8>,
+
+    // IDAT tracking & streaming state
+    pub idat_bytes_written: usize,
+    pub expected_idat_size: usize,
+    current_chunk_written: usize,
+    current_chunk_target: usize,
+    current_chunk_crc: u32,
 }
 
 fn zlib_crc32(crc: u32, buf: &[u8]) -> u32 {
@@ -94,10 +104,10 @@ fn flush_idat_accumulator(enc: &mut PngEncoder, force: bool) -> Result<(), Strin
     while enc.idat_accumulator.len() >= enc.max_idat_size || (force && !enc.idat_accumulator.is_empty()) {
         let chunk_size = enc.idat_accumulator.len().min(enc.max_idat_size);
 
-        // Drain up to max_idat_size bytes from the accumulator and write as an IDAT chunk
         let chunk_data: Vec<u8> = enc.idat_accumulator.drain(..chunk_size).collect();
         write_chunk(&mut enc.writer, b"IDAT", &chunk_data)
         .map_err(|_| "Failed to write IDAT chunk".to_string())?;
+        enc.idat_bytes_written += chunk_size;
     }
     Ok(())
 }
@@ -105,12 +115,73 @@ fn flush_idat_accumulator(enc: &mut PngEncoder, force: bool) -> Result<(), Strin
 fn write_idat(enc: &mut PngEncoder) -> Result<(), String> {
     let produced = enc.out_buf.len() - enc.zstream.avail_out as usize;
     if produced > 0 {
-        enc.idat_accumulator.extend_from_slice(&enc.out_buf[..produced]);
+        if enc.expected_idat_size > 0 {
+            // Temporarily take ownership of out_buf so data doesn't alias enc
+            let out_buf = std::mem::take(&mut enc.out_buf);
+
+            let res = stream_idat_bytes(enc, &out_buf[..produced]);
+
+            // Put out_buf back into enc
+            enc.out_buf = out_buf;
+
+            res?;
+        } else {
+            enc.idat_accumulator.extend_from_slice(&enc.out_buf[..produced]);
+        }
     }
     enc.zstream.next_out = enc.out_buf.as_mut_ptr();
     enc.zstream.avail_out = enc.out_buf.len() as u32;
 
-    flush_idat_accumulator(enc, false)
+    if enc.expected_idat_size == 0 {
+        flush_idat_accumulator(enc, false)?;
+    }
+    Ok(())
+}
+
+fn finish_png_encode(enc: &mut PngEncoder) -> bool {
+    enc.zstream.next_in = ptr::null_mut();
+    enc.zstream.avail_in = 0;
+
+    loop {
+        if enc.zstream.avail_out == 0 {
+            if let Err(e) = write_idat(enc) {
+                set_last_error(&format!("IO Write Error during final stream flush: {}", e));
+                return false;
+            }
+        }
+        let ret = unsafe { libz_sys::deflate(enc.zstream.as_mut(), libz_sys::Z_FINISH) };
+        if ret == libz_sys::Z_STREAM_END {
+            break;
+        } else if ret != libz_sys::Z_OK && ret != libz_sys::Z_BUF_ERROR {
+            set_last_error(&format!("ZLIB deflate finish error code: {}", ret));
+            return false;
+        }
+    }
+
+    if let Err(e) = write_idat(enc) {
+        set_last_error(&format!("IO Write Error writing remaining IDAT data: {}", e));
+        return false;
+    }
+
+    if enc.expected_idat_size == 0 {
+        if let Err(e) = flush_idat_accumulator(enc, true) {
+            set_last_error(&format!("IO Write Error flushing accumulated IDAT chunks: {}", e));
+            return false;
+        }
+    }
+
+    if let Err(e) = write_chunk(&mut enc.writer, b"IEND", &[]) {
+        set_last_error(&format!("IO Write Error writing IEND chunk: {}", e));
+        return false;
+    }
+
+    if let Err(e) = enc.writer.flush() {
+        set_last_error(&format!("IO Flush Error: {}", e));
+        return false;
+    }
+
+    unsafe { libz_sys::deflateEnd(enc.zstream.as_mut()) };
+    true
 }
 
 // High performance filter implementations
@@ -258,6 +329,44 @@ fn apply_filter_adaptive(curr: &[u8], prev: &[u8], bpp: usize, out: &mut [u8], t
     }
 }
 
+fn stream_idat_bytes(enc: &mut PngEncoder, mut data: &[u8]) -> Result<(), String> {
+    while !data.is_empty() {
+        if enc.current_chunk_written == enc.current_chunk_target {
+            let remaining_total = enc.expected_idat_size.saturating_sub(enc.idat_bytes_written);
+            if remaining_total == 0 {
+                break;
+            }
+            let chunk_size = remaining_total.min(enc.max_idat_size);
+
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&(chunk_size as u32).to_be_bytes());
+            header[4..8].copy_from_slice(b"IDAT");
+            enc.writer.write_all(&header).map_err(|_| "Failed to write IDAT header".to_string())?;
+
+            enc.current_chunk_crc = zlib_crc32(0, b"IDAT");
+            enc.current_chunk_written = 0;
+            enc.current_chunk_target = chunk_size;
+        }
+
+        let needed = enc.current_chunk_target - enc.current_chunk_written;
+        let to_write = data.len().min(needed);
+
+        enc.writer.write_all(&data[..to_write]).map_err(|_| "Failed to write IDAT payload".to_string())?;
+        enc.current_chunk_crc = zlib_crc32(enc.current_chunk_crc, &data[..to_write]);
+
+        enc.current_chunk_written += to_write;
+        enc.idat_bytes_written += to_write;
+        data = &data[to_write..];
+
+        if enc.current_chunk_written == enc.current_chunk_target {
+            enc.writer.write_all(&enc.current_chunk_crc.to_be_bytes())
+            .map_err(|_| "Failed to write IDAT CRC".to_string())?;
+        }
+    }
+    Ok(())
+}
+
+
 impl PngEncoder {
     fn new(
         mut writer: Box<dyn Write>,
@@ -327,6 +436,8 @@ impl PngEncoder {
             (options.max_idat_size as usize).min(MAX_PNG_CHUNK_SIZE)
         };
 
+        let expected_idat_size = options.expected_idat_size;
+
         Ok(Self {
             writer: BufWriter::with_capacity(1024 * 1024, writer),
            zstream,
@@ -343,6 +454,12 @@ impl PngEncoder {
            row_buf: vec![0u8; bytes_per_scanline + 1],
            prev_row: vec![0u8; bytes_per_scanline],
            temp_row: vec![0u8; bytes_per_scanline + 1],
+
+           idat_bytes_written: 0,
+           expected_idat_size,
+           current_chunk_written: 0,
+           current_chunk_target: 0,
+           current_chunk_crc: 0,
         })
     }
 }
@@ -459,49 +576,20 @@ pub extern "C" fn close_png_encode(handle: *mut PngEncoder) -> bool {
         return false;
     }
     let mut enc = unsafe { Box::from_raw(handle) };
+    finish_png_encode(&mut enc)
+}
 
-    enc.zstream.next_in = ptr::null_mut();
-    enc.zstream.avail_in = 0;
-
-    loop {
-        if enc.zstream.avail_out == 0 {
-            if let Err(e) = write_idat(&mut enc) {
-                set_last_error(&format!("IO Write Error during final stream flush: {}", e));
-                return false;
-            }
-        }
-        let ret = unsafe { libz_sys::deflate(enc.zstream.as_mut(), libz_sys::Z_FINISH) };
-        if ret == libz_sys::Z_STREAM_END {
-            break;
-        } else if ret != libz_sys::Z_OK && ret != libz_sys::Z_BUF_ERROR {
-            set_last_error(&format!("ZLIB deflate finish error code: {}", ret));
-            return false;
-        }
+#[unsafe(no_mangle)]
+pub extern "C" fn close_png_encode_get_idat_size(handle: *mut PngEncoder) -> usize {
+    if handle.is_null() {
+        return 0;
     }
-
-    if let Err(e) = write_idat(&mut enc) {
-        set_last_error(&format!("IO Write Error writing remaining IDAT data: {}", e));
-        return false;
+    let mut enc = unsafe { Box::from_raw(handle) };
+    if finish_png_encode(&mut enc) {
+        enc.idat_bytes_written
+    } else {
+        0
     }
-
-    // Force flush any remaining accumulated IDAT data
-    if let Err(e) = flush_idat_accumulator(&mut enc, true) {
-        set_last_error(&format!("IO Write Error flushing accumulated IDAT chunks: {}", e));
-        return false;
-    }
-
-    if let Err(e) = write_chunk(&mut enc.writer, b"IEND", &[]) {
-        set_last_error(&format!("IO Write Error writing IEND chunk: {}", e));
-        return false;
-    }
-
-    if let Err(e) = enc.writer.flush() {
-        set_last_error(&format!("IO Flush Error: {}", e));
-        return false;
-    }
-
-    unsafe { libz_sys::deflateEnd(enc.zstream.as_mut()) };
-    true
 }
 
 #[unsafe(no_mangle)]

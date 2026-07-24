@@ -248,6 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window_bits: args.window_bits,
         mem_level: args.mem_level,
         max_idat_size: 0,
+        expected_idat_size: 0,
     };
 
     let raw_input: Box<dyn Read> = if args.input == "-" {
